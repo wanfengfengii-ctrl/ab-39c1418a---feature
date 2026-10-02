@@ -8,7 +8,9 @@ the health check; the wait here only adds robustness), then runs:
                               verifies routes and the OpenAPI schema
 3. API smoke tests        -- a set of overlapping-pulse scenarios against the
                              live service (exact recovery, noisy recovery,
-                             infeasible residual/event limits, validation)
+                             infeasible residual/event limits, validation,
+                             strong-pulse clipping with an integrating
+                             readout, and a legacy compatibility regression)
 
 The process exits by itself; the exit code summarises the results:
 0 = everything passed, otherwise a bitmask
@@ -140,6 +142,14 @@ class Smoke:
         noisy_samples = list(exact_samples)
         noisy_samples[5] += 1
         noisy_samples[7] -= 1
+        # Strong-pulse fixture: the same ground truth clipped at an ADC
+        # platform of 12 (positions 4 and 6 top the platform), plus a
+        # single-clipped variant.
+        clip_level = 12
+        clipped_samples = [min(v, clip_level) for v in exact_samples]
+        single_clip_samples = [
+            min(v, clip_level) for v in _convolve({4: 5}, kernel, n)
+        ]
 
         # Case 1: exact recovery of overlapping pulses.
         code, body = _request("POST", "/api/pulses/deconvolve", {
@@ -227,6 +237,133 @@ class Smoke:
             "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
         })
         self.check("oversized kernel rejected with 400", code == 400, f"got {code}")
+
+        # Case 6: strong pulse clips a single platform sample; the unclipped
+        # waveform must be recovered with per-point excess evidence.
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": single_clip_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+            "saturationLevel": clip_level,
+        })
+        self.check("single clip returns 200", code == 200, f"got {code}: {body}")
+        if code == 200:
+            self.check(
+                "single clip recovers unclipped pulse",
+                body.get("events") == [{"position": 4, "amplitude": 5}],
+                f"got {body.get('events')}",
+            )
+            self.check(
+                "single clip keeps full unclipped prediction",
+                body.get("prediction")
+                == [0, 0, 0, 0, 15, 10, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                f"got {body.get('prediction')}",
+            )
+            self.check(
+                "single clip evidence",
+                body.get("saturation") == {
+                    "totalAmplitude": 5,
+                    "saturatedPoints": [
+                        {"position": 4, "sample": 12, "prediction": 15, "excess": 3},
+                    ],
+                },
+                f"got {body.get('saturation')}",
+            )
+            self.check(
+                "single clip residual objective ignores clipped point",
+                body.get("objectives") == {
+                    "maxAbsResidual": 0, "sumAbsResidual": 0, "eventCount": 1,
+                },
+                f"got {body.get('objectives')}",
+            )
+
+        # Case 7: overlapping clipped pulses jointly constrained by the
+        # independent integrating readout (closed total-amplitude interval).
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": clipped_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+            "saturationLevel": clip_level, "totalAmplitudeRange": [9, 9],
+        })
+        self.check("clipped overlap with total range returns 200",
+                   code == 200, f"got {code}: {body}")
+        if code == 200:
+            self.check(
+                "clipped overlap events recovered",
+                body.get("events") == [
+                    {"position": 4, "amplitude": 5},
+                    {"position": 6, "amplitude": 4},
+                ],
+                f"got {body.get('events')}",
+            )
+            self.check(
+                "clipped overlap total and excess evidence",
+                body.get("saturation") == {
+                    "totalAmplitude": 9,
+                    "saturatedPoints": [
+                        {"position": 4, "sample": 12, "prediction": 15, "excess": 3},
+                        {"position": 6, "sample": 12, "prediction": 17, "excess": 5},
+                    ],
+                },
+                f"got {body.get('saturation')}",
+            )
+
+        # Case 8: integrating interval conflicts with every explainable event
+        # train -> identifiable non-invertible conclusion naming the first
+        # position without an extendible candidate and echoing the constraint.
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": single_clip_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+            "saturationLevel": clip_level, "totalAmplitudeRange": [0, 4],
+        })
+        self.check("total-range conflict returns 422", code == 422, f"got {code}: {body}")
+        self.check("total-range conflict flagged infeasible",
+                   body.get("status") == "infeasible", f"got {body}")
+        self.check("total-range conflict first unextendible position",
+                   body.get("firstUnexplainablePosition") == 5,
+                   f"got {body.get('firstUnexplainablePosition')}")
+        self.check("total-range conflict echoes constraint",
+                   body.get("totalAmplitudeRange") == [0, 4],
+                   f"got {body.get('totalAmplitudeRange')}")
+
+        # Case 9: illegal inputs around saturation are rejected.
+        code, _ = _request("POST", "/api/pulses/deconvolve", {
+            "samples": [0, 0, 0, 0, 13, 10, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "kernel": kernel, "maxResidual": 0, "maxAmplitude": 10,
+            "maxEvents": 4, "saturationLevel": clip_level,
+        })
+        self.check("sample above saturation level rejected with 400",
+                   code == 400, f"got {code}")
+        code, _ = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+            "totalAmplitudeRange": [1, 9],
+        })
+        self.check("total range without saturation level rejected with 400",
+                   code == 400, f"got {code}")
+
+        # Case 10: compatibility regression -- an unmodified request keeps the
+        # original service shape exactly (no saturation block anywhere).
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+        })
+        self.check("legacy request returns 200", code == 200, f"got {code}: {body}")
+        if code == 200:
+            self.check("legacy response has no saturation block",
+                       "saturation" not in body, f"keys={sorted(body)}")
+            self.check(
+                "legacy objectives unchanged",
+                body.get("objectives") == {
+                    "maxAbsResidual": 0, "sumAbsResidual": 0, "eventCount": 2,
+                },
+                f"got {body.get('objectives')}",
+            )
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 1,
+        })
+        self.check("legacy infeasible response has no range echo",
+                   code == 422 and "totalAmplitudeRange" not in body,
+                   f"got {code}: {body}")
 
         ok = not self.failures
         print(f"smoke tests: {'PASS' if ok else 'FAIL'}", flush=True)

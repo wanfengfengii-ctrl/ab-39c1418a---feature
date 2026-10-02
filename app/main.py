@@ -12,15 +12,19 @@ from .schemas import (
     Event,
     InfeasibleResponse,
     Objectives,
+    SaturatedPointEvidence,
+    SaturationEvidenceResponse,
 )
 
 app = FastAPI(
     title="Scintillator Pulse Deconvolution",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Joint non-negative integer deconvolution of overlapping scintillator "
         "pulses: recovers event positions/amplitudes, the predicted waveform "
-        "and pointwise residuals from discrete samples."
+        "and pointwise residuals from discrete samples. Supports clipped "
+        "(ADC-saturated) readings constrained by an independent integrating "
+        "readout."
     ),
 )
 
@@ -53,7 +57,7 @@ def healthz() -> dict:
 def root() -> dict:
     return {
         "service": "pulse-deconvolve",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "docs": "/docs",
         "healthz": "/healthz",
     }
@@ -62,10 +66,16 @@ def root() -> dict:
 @app.post(
     "/api/pulses/deconvolve",
     response_model=DeconvolveSuccessResponse,
+    # Optional evidence is omitted (not rendered as null) so requests without
+    # saturationLevel keep the byte-for-byte original response shape.
+    response_model_exclude_none=True,
     responses={
         422: {
             "model": InfeasibleResponse,
-            "description": "No event train satisfies the residual/event-count limits.",
+            "description": (
+                "No extendible event train satisfies the residual/event-count "
+                "limits (and the total-amplitude interval when given)."
+            ),
         },
         400: {"description": "Request failed validation."},
     },
@@ -77,17 +87,38 @@ def deconvolve(req: DeconvolveRequest):
         max_residual=req.maxResidual,
         max_amplitude=req.maxAmplitude,
         max_events=req.maxEvents,
+        saturation_level=req.saturationLevel,
+        total_amplitude_range=(
+            tuple(req.totalAmplitudeRange)
+            if req.totalAmplitudeRange is not None
+            else None
+        ),
     )
     if not result.feasible:
         body = InfeasibleResponse(
-            firstUnexplainablePosition=result.first_unexplainable_position
+            firstUnexplainablePosition=result.first_unexplainable_position,
+            totalAmplitudeRange=req.totalAmplitudeRange,
         )
-        return JSONResponse(status_code=422, content=body.model_dump())
+        return JSONResponse(status_code=422, content=body.model_dump(exclude_none=True))
     events = [
         Event(position=i, amplitude=a)
         for i, a in enumerate(result.amplitudes)
         if a > 0
     ]
+    saturation = None
+    if result.saturation_evidence is not None:
+        saturation = SaturationEvidenceResponse(
+            totalAmplitude=result.saturation_evidence.total_amplitude,
+            saturatedPoints=[
+                SaturatedPointEvidence(
+                    position=point.position,
+                    sample=point.sample,
+                    prediction=point.prediction,
+                    excess=point.excess,
+                )
+                for point in result.saturation_evidence.saturated_points
+            ],
+        )
     return DeconvolveSuccessResponse(
         events=events,
         amplitudes=result.amplitudes,
@@ -98,4 +129,5 @@ def deconvolve(req: DeconvolveRequest):
             sumAbsResidual=result.sum_abs_residual,
             eventCount=result.event_count,
         ),
+        saturation=saturation,
     )
