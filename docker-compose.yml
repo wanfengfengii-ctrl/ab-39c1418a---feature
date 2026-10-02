@@ -1,0 +1,33 @@
+name: pulse-deconvolve
+
+services:
+  api:
+    build:
+      context: .
+      target: api
+    image: pulse-deconvolve-api:latest
+    ports:
+      # Host port is configurable: API_HOST_PORT=9000 docker compose up
+      - "${API_HOST_PORT:-8000}:8000"
+    healthcheck:
+      # Confirms the service is up and accepting requests.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: pulse-deconvolve-verify:latest
+    depends_on:
+      api:
+        # One-shot service: starts only once the API reports healthy.
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://api:8000
+      APP_DIR: /app
+    restart: "no"
