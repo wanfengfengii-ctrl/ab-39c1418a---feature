@@ -116,3 +116,117 @@ def test_deterministic_responses():
     second = client.post("/api/pulses/deconvolve", json=make_payload(maxResidual=1, samples=NOISY_SAMPLES))
     assert first.status_code == 200
     assert first.json() == second.json()
+
+
+CLIPPED_SAMPLES = [0, 0, 0, 0, 15, 10, 20, 12, 6, 0, 0, 0]
+
+
+def test_legacy_response_shape_unchanged_without_clipping_fields():
+    resp = client.post("/api/pulses/deconvolve", json=make_payload())
+    body = resp.json()
+    assert set(body) == {"status", "events", "amplitudes", "prediction", "residuals", "objectives"}
+
+
+def test_clipped_overlap_recovers_unclipped_prediction():
+    resp = client.post(
+        "/api/pulses/deconvolve",
+        json=make_payload(
+            samples=CLIPPED_SAMPLES,
+            saturationLevel=20,
+            totalAmplitudeRange=[11, 11],
+        ),
+    )
+    assert resp.status_code == 200, f"{resp.json()}"
+    body = resp.json()
+    assert body["events"] == [
+        {"position": 4, "amplitude": 5},
+        {"position": 6, "amplitude": 6},
+    ]
+    assert body["prediction"][6] == 23
+    assert body["residuals"][6] == -3
+    assert body["totalAmplitude"] == 11
+    assert body["totalAmplitudeRange"] == [11, 11]
+    assert body["saturationEvidence"] == [
+        {"position": 6, "observed": 20, "predicted": 23, "excess": 3}
+    ]
+    assert body["objectives"]["maxAbsResidual"] == 0
+
+
+def test_clipped_total_conflict_returns_identifiable_422():
+    resp = client.post(
+        "/api/pulses/deconvolve",
+        json=make_payload(
+            samples=CLIPPED_SAMPLES,
+            saturationLevel=20,
+            totalAmplitudeRange=[1, 2],
+        ),
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["status"] == "infeasible"
+    assert body["constraint"] == "totalAmplitudeRange"
+    assert body["totalAmplitudeRange"] == [1, 2]
+    assert "firstUnexplainablePosition" in body
+
+
+def test_sample_above_saturation_is_invalid():
+    resp = client.post(
+        "/api/pulses/deconvolve",
+        json=make_payload(
+            samples=CLIPPED_SAMPLES,
+            saturationLevel=15,  # samples contain 20 > 15
+            totalAmplitudeRange=[11, 11],
+        ),
+    )
+    assert resp.status_code == 400
+    assert resp.json()["status"] == "invalid_request"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"saturationLevel": 15},                                  # range missing
+        {"totalAmplitudeRange": [5, 9]},                          # level missing
+        {"saturationLevel": 15, "totalAmplitudeRange": [9, 5]},   # lo > hi
+        {"saturationLevel": 15, "totalAmplitudeRange": [5]},      # not a pair
+        {"saturationLevel": 15, "totalAmplitudeRange": [-1, 5]},  # negative lo
+    ],
+)
+def test_clipping_field_combinations_invalid(overrides):
+    resp = client.post(
+        "/api/pulses/deconvolve", json=make_payload(**overrides)
+    )
+    assert resp.status_code == 400
+    assert resp.json()["status"] == "invalid_request"
+
+
+def test_clipping_legacy_infeasible_body_keeps_shape():
+    # A residual-limit infeasibility outside clipping mode stays unchanged.
+    resp = client.post(
+        "/api/pulses/deconvolve",
+        json=make_payload(samples=NOISY_SAMPLES, maxResidual=0),
+    )
+    body = resp.json()
+    assert set(body) == {"status", "detail", "firstUnexplainablePosition"}
+
+
+def test_underconstrained_clipping_reports_budget():
+    # Every sample at the plateau with loose event/total limits leaves too
+    # many admissible trains for exact joint inversion within the budget.
+    resp = client.post(
+        "/api/pulses/deconvolve",
+        json=make_payload(
+            samples=[15] * 16,
+            saturationLevel=15,
+            totalAmplitudeRange=[0, 300],
+            maxAmplitude=1000,
+            maxEvents=16,
+            maxResidual=0,
+        ),
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["status"] == "infeasible"
+    assert body["constraint"] == "stateBudgetExceeded"
+    assert isinstance(body["firstUnexplainablePosition"], int)
+    assert body["totalAmplitudeRange"] == [0, 300]

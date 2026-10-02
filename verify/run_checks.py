@@ -228,6 +228,95 @@ class Smoke:
         })
         self.check("oversized kernel rejected with 400", code == 400, f"got {code}")
 
+        # Case 6 (strong-pulse clipping): a stacked pulse drives the ADC to
+        # its plateau; an independent integrator reading constrains the total
+        # amplitude and the un-clipped prediction must be recovered.
+        level = 20
+        clipped_samples = [0, 0, 0, 0, 15, 10, level, 12, 6, 0, 0, 0, 0, 0, 0, 0]
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": clipped_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+            "saturationLevel": level, "totalAmplitudeRange": [11, 11],
+        })
+        self.check("clipped overlap returns 200", code == 200, f"got {code}: {body}")
+        if code == 200:
+            self.check(
+                "clipped overlap events recovered",
+                body.get("events") == [
+                    {"position": 4, "amplitude": 5},
+                    {"position": 6, "amplitude": 6},
+                ],
+                f"got {body.get('events')}",
+            )
+            self.check(
+                "clipped overlap keeps un-clipped prediction",
+                body.get("prediction", [None] * 7)[6] == 23,
+                f"got {body.get('prediction')}",
+            )
+            self.check(
+                "clipped overlap reports total amplitude",
+                body.get("totalAmplitude") == 11
+                and body.get("totalAmplitudeRange") == [11, 11],
+                f"got {body.get('totalAmplitude')}",
+            )
+            self.check(
+                "clipped overlap reports excess evidence",
+                body.get("saturationEvidence") == [
+                    {"position": 6, "observed": level,
+                     "predicted": 23, "excess": 3},
+                ],
+                f"got {body.get('saturationEvidence')}",
+            )
+            # The plateau point is no longer an exact residual; objective
+            # values are computed on genuinely observed points only.
+            self.check(
+                "clipped overlap objectives from observed points",
+                body.get("objectives") == {
+                    "maxAbsResidual": 0, "sumAbsResidual": 0, "eventCount": 2,
+                },
+                f"got {body.get('objectives')}",
+            )
+
+        # Case 7: the integrator interval conflicts with every explainable
+        # train -> identifiable non-invertible conclusion naming the bound.
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": clipped_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+            "saturationLevel": level, "totalAmplitudeRange": [1, 2],
+        })
+        self.check("total-range conflict returns 422", code == 422, f"got {code}: {body}")
+        self.check("total-range conflict flagged infeasible",
+                   body.get("status") == "infeasible", f"got {body}")
+        self.check("total-range conflict names the constraint",
+                   body.get("constraint") == "totalAmplitudeRange",
+                   f"got {body.get('constraint')}")
+        self.check("total-range conflict echoes the interval",
+                   body.get("totalAmplitudeRange") == [1, 2],
+                   f"got {body.get('totalAmplitudeRange')}")
+        self.check("total-range conflict names first position",
+                   isinstance(body.get("firstUnexplainablePosition"), int),
+                   f"got {body.get('firstUnexplainablePosition')}")
+
+        # Case 8: samples above the saturation level are illegal.
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": clipped_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+            "saturationLevel": 15, "totalAmplitudeRange": [11, 11],
+        })
+        self.check("sample above saturation rejected with 400",
+                   code == 400, f"got {code}: {body}")
+
+        # Case 9 (compatibility regression): a legacy request must keep the
+        # exact service shape -- no clipping fields leak into the body.
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+        })
+        legacy_keys = {"status", "events", "amplitudes", "prediction",
+                       "residuals", "objectives"}
+        self.check("legacy response shape unchanged", code == 200
+                   and set(body) == legacy_keys, f"got {sorted(body)}")
+
         ok = not self.failures
         print(f"smoke tests: {'PASS' if ok else 'FAIL'}", flush=True)
         return ok

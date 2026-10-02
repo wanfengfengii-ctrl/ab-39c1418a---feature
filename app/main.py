@@ -12,6 +12,7 @@ from .schemas import (
     Event,
     InfeasibleResponse,
     Objectives,
+    SaturationEvidence,
 )
 
 app = FastAPI(
@@ -71,24 +72,61 @@ def root() -> dict:
     },
 )
 def deconvolve(req: DeconvolveRequest):
+    clipping = req.saturationLevel is not None
     result = solve(
         samples=req.samples,
         kernel=req.kernel,
         max_residual=req.maxResidual,
         max_amplitude=req.maxAmplitude,
         max_events=req.maxEvents,
+        saturation_level=req.saturationLevel,
+        total_amplitude_range=(
+            tuple(req.totalAmplitudeRange) if clipping else None
+        ),
     )
     if not result.feasible:
-        body = InfeasibleResponse(
-            firstUnexplainablePosition=result.first_unexplainable_position
+        if result.constraint == "budget":
+            body = InfeasibleResponse(
+                detail=(
+                    "the clipping constraints leave too many admissible event "
+                    "trains for exact joint inversion within the solver state "
+                    "budget; tighten maxEvents or totalAmplitudeRange"
+                ),
+                firstUnexplainablePosition=result.first_unexplainable_position,
+                constraint="stateBudgetExceeded",
+                totalAmplitudeRange=req.totalAmplitudeRange,
+            )
+        elif clipping:
+            detail = (
+                "no event train within the amplitude, event-count and "
+                "total-amplitude limits can reproduce the samples "
+                "(pointwise clipping at the saturation level) within the "
+                "residual limit"
+            )
+            body = InfeasibleResponse(
+                detail=detail,
+                firstUnexplainablePosition=result.first_unexplainable_position,
+                constraint=(
+                    "totalAmplitudeRange"
+                    if result.constraint == "total"
+                    else "residualLimit"
+                ),
+                totalAmplitudeRange=req.totalAmplitudeRange,
+            )
+        else:
+            body = InfeasibleResponse(
+                firstUnexplainablePosition=result.first_unexplainable_position
+            )
+        # exclude_none keeps the legacy 422 body byte-for-byte unchanged.
+        return JSONResponse(
+            status_code=422, content=body.model_dump(exclude_none=True)
         )
-        return JSONResponse(status_code=422, content=body.model_dump())
     events = [
         Event(position=i, amplitude=a)
         for i, a in enumerate(result.amplitudes)
         if a > 0
     ]
-    return DeconvolveSuccessResponse(
+    response = DeconvolveSuccessResponse(
         events=events,
         amplitudes=result.amplitudes,
         prediction=result.prediction,
@@ -98,4 +136,20 @@ def deconvolve(req: DeconvolveRequest):
             sumAbsResidual=result.sum_abs_residual,
             eventCount=result.event_count,
         ),
+    )
+    if clipping:
+        response.totalAmplitude = result.total_amplitude
+        response.totalAmplitudeRange = req.totalAmplitudeRange
+        response.saturationEvidence = [
+            SaturationEvidence(
+                position=pos,
+                observed=req.saturationLevel,
+                predicted=result.prediction[pos],
+                excess=result.saturation_excess[i],
+            )
+            for i, pos in enumerate(result.saturation_positions)
+        ]
+    # exclude_none keeps the legacy 200 body byte-for-byte unchanged.
+    return JSONResponse(
+        status_code=200, content=response.model_dump(exclude_none=True)
     )
